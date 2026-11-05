@@ -14,7 +14,9 @@ use obsr::requests::{
 use obsr::{Client, ConnectOptions, Encoding, Error, Event, EventSubscription, RequestBatch};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::runtime::Runtime;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 
 const VERSION_DATA: &str = r#"{
@@ -230,6 +232,53 @@ async fn fails_when_the_server_sends_garbage_during_the_handshake() {
 
     let error = within(Client::connect(url)).await.unwrap_err();
     assert!(matches!(error, Error::Decode { .. }), "{error:?}");
+    within(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn fails_when_the_server_answers_identify_with_the_wrong_message() {
+    let (url, server) = serve(|mut conn| async move {
+        conn.send(HELLO, hello(None)).await;
+        conn.expect(IDENTIFY).await;
+        conn.send(HELLO, hello(None)).await;
+    })
+    .await;
+
+    let error = within(Client::connect(url)).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Protocol(message) if message.contains("expected Identified")),
+        "{error:?}"
+    );
+    within(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn pings_during_the_handshake_do_not_disturb_connecting() {
+    /// Like `Conn::expect`, for when the client may also be answering pings.
+    async fn expect_after_pongs(conn: &mut Conn, expected: u8) -> Value {
+        loop {
+            match conn.recv().await {
+                Received::Pong => {}
+                Received::Message { op, data } if op == expected => return data,
+                other => panic!("expected op {expected}, got {other:?}"),
+            }
+        }
+    }
+
+    let (url, server) = serve(|mut conn| async move {
+        conn.send_frame(Message::Ping(vec![1].into())).await;
+        conn.send(HELLO, hello(None)).await;
+        expect_after_pongs(&mut conn, IDENTIFY).await;
+        conn.send_frame(Message::Ping(vec![2].into())).await;
+        conn.send(IDENTIFIED, json!({"negotiatedRpcVersion": 1}))
+            .await;
+        let request = expect_after_pongs(&mut conn, REQUEST).await;
+        conn.respond(&request, None).await;
+    })
+    .await;
+
+    let client = within(Client::connect(url)).await.unwrap();
+    within(client.request_raw("Sync", None)).await.unwrap();
     within(server).await.unwrap();
 }
 
@@ -539,6 +588,83 @@ async fn supports_user_defined_requests() {
         .await
         .unwrap();
     assert_eq!(response.other_value, 2);
+    within(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_request_that_cannot_be_serialized_is_reported_and_never_sent() {
+    struct Unserializable;
+    impl Serialize for Unserializable {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("not today"))
+        }
+    }
+    impl Request for Unserializable {
+        const REQUEST_TYPE: &'static str = "Unserializable";
+        type Response = Value;
+    }
+
+    let (url, server) = serve(|mut conn| async move {
+        conn.handshake().await;
+        // The first thing to arrive is the request sent after the failures.
+        let request = conn.expect(REQUEST).await;
+        assert_eq!(request["requestType"], "Sync");
+        conn.respond(&request, None).await;
+    })
+    .await;
+
+    let client = within(Client::connect(url)).await.unwrap();
+    let error = within(client.request(Unserializable)).await.unwrap_err();
+    let Error::Encode { context, .. } = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert!(context.contains("Unserializable"), "{context}");
+    assert!(matches!(
+        RequestBatch::new().push(Unserializable),
+        Err(Error::Encode { .. })
+    ));
+
+    within(client.request_raw("Sync", None)).await.unwrap();
+    within(server).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_reply_of_the_wrong_kind_fails_that_call_but_not_the_connection() {
+    let (url, server) = serve(|mut conn| async move {
+        conn.handshake().await;
+        let request = conn.expect(REQUEST).await;
+        conn.send(
+            REQUEST_BATCH_RESPONSE,
+            json!({"requestId": request["requestId"], "results": []}),
+        )
+        .await;
+        let batch = conn.expect(REQUEST_BATCH).await;
+        conn.send(
+            REQUEST_RESPONSE,
+            json!({
+                "requestType": "Sync",
+                "requestId": batch["requestId"],
+                "requestStatus": {"result": true, "code": 100},
+            }),
+        )
+        .await;
+        conn.answer_next_request().await;
+    })
+    .await;
+
+    let client = within(Client::connect(url)).await.unwrap();
+    let error = within(client.request_raw("Sync", None)).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Protocol(message) if message.contains("batch response")),
+        "{error:?}"
+    );
+    let error = within(client.batch(RequestBatch::new())).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::Protocol(message) if message.contains("single response")),
+        "{error:?}"
+    );
+
+    within(client.request_raw("Sync", None)).await.unwrap();
     within(server).await.unwrap();
 }
 
@@ -1297,6 +1423,61 @@ async fn close_finishes_even_if_the_server_never_replies() {
     within(client.close()).await;
     assert!(client.is_closed());
     server.abort();
+}
+
+#[tokio::test]
+async fn is_closed_is_false_until_the_connection_ends() {
+    let (url, server) = serve(|mut conn| async move {
+        conn.handshake().await;
+        conn.answer_next_request().await;
+        conn.close(1000, "done").await;
+    })
+    .await;
+
+    let client = within(Client::connect(url)).await.unwrap();
+    // The server is waiting for the request below, so it cannot have closed yet.
+    assert!(!client.is_closed());
+    within(client.request_raw("Sync", None)).await.unwrap();
+    within(client.closed()).await;
+    assert!(client.is_closed());
+    within(server).await.unwrap();
+}
+
+#[test]
+fn a_killed_connection_task_fails_callers_instead_of_leaving_them_hanging() {
+    let test_runtime = Runtime::new().unwrap();
+    // The connection task runs here, so the test can kill it and nothing else.
+    let connection_runtime = Runtime::new().unwrap();
+
+    let (request_arrived, wait_for_request) = oneshot::channel();
+    let (url, server) = test_runtime.block_on(serve(|mut conn| async move {
+        conn.handshake().await;
+        conn.expect(REQUEST).await;
+        request_arrived.send(()).unwrap();
+        // The task dies without a close frame.
+        let received = conn.recv().await;
+        assert!(matches!(received, Received::Ended), "{received:?}");
+    }));
+    let client = connection_runtime
+        .block_on(within(Client::connect(url)))
+        .unwrap();
+    let pending = test_runtime.spawn({
+        let client = client.clone();
+        async move { client.request_raw("Sync", None).await }
+    });
+    test_runtime.block_on(within(wait_for_request)).unwrap();
+
+    drop(connection_runtime);
+
+    assert!(client.is_closed());
+    test_runtime.block_on(async {
+        assert_eq!(within(client.closed()).await.code, None);
+        let error = within(pending).await.unwrap().unwrap_err();
+        assert!(matches!(error, Error::Closed(_)), "{error:?}");
+        let error = within(client.request_raw("Sync", None)).await.unwrap_err();
+        assert!(matches!(error, Error::Closed(_)), "{error:?}");
+        within(server).await.unwrap();
+    });
 }
 
 #[tokio::test]

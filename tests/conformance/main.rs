@@ -510,6 +510,22 @@ fn event_subscription_flags_combine() {
 }
 
 #[test]
+fn adding_event_subscription_flags_that_are_already_set_changes_nothing() {
+    let mask = EventSubscription::SCENES | EventSubscription::INPUTS;
+    assert_eq!(mask | EventSubscription::SCENES, mask);
+    let mut combined = mask;
+    combined |= EventSubscription::SCENES;
+    assert_eq!(combined, mask);
+}
+
+#[test]
+fn intersecting_event_subscriptions_keeps_only_the_shared_flags() {
+    let mask = EventSubscription::SCENES | EventSubscription::INPUTS;
+    assert_eq!(mask & EventSubscription::SCENES, EventSubscription::SCENES);
+    assert_eq!(mask & EventSubscription::UI, EventSubscription::NONE);
+}
+
+#[test]
 fn nullable_request_fields_can_be_cleared_or_left_unchanged() {
     use obsr::requests::{SetProfileParameter, SetSceneSceneTransitionOverride};
 
