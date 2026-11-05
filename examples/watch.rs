@@ -1,8 +1,10 @@
 //! Prints information about an OBS instance, then prints events until OBS exits or Ctrl-C.
 //!
 //! ```text
-//! cargo run --example watch -- ws://localhost:4455 [password]
+//! cargo run --example watch
 //! ```
+//!
+//! Set `OBS_URL` and `OBS_PASSWORD` to change where it connects.
 
 use obsr::requests::{GetSceneList, GetVersion};
 use obsr::{ConnectOptions, Event, Result};
@@ -10,12 +12,9 @@ use tokio::sync::broadcast::error::RecvError;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let url = args
-        .next()
-        .unwrap_or_else(|| "ws://localhost:4455".to_owned());
+    let url = std::env::var("OBS_URL").unwrap_or_else(|_| "ws://localhost:4455".to_owned());
     let mut options = ConnectOptions::new(url);
-    if let Some(password) = args.next() {
+    if let Ok(password) = std::env::var("OBS_PASSWORD") {
         options = options.password(password);
     }
 

@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "An async obs-websocket 5.x client, built on Tokio"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/a-poor/obsr"
 keywords = ["obs", "obs-websocket", "websocket", "tokio", "async"]
 categories = ["api-bindings", "asynchronous", "multimedia"]
+exclude = [".cargo", ".gitattributes", ".github"]
 
 [dependencies]
 base64 = "0.23.1"

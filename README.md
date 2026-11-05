@@ -1,5 +1,10 @@
 # obsr
 
+[![Crates.io](https://img.shields.io/crates/v/obsr.svg)](https://crates.io/crates/obsr)
+[![Docs.rs](https://img.shields.io/docsrs/obsr)](https://docs.rs/obsr)
+[![CI](https://github.com/a-poor/obsr/actions/workflows/ci.yml/badge.svg)](https://github.com/a-poor/obsr/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 An async [obs-websocket](https://github.com/obsproject/obs-websocket) 5.x client for Rust, built on
 Tokio and `tokio-tungstenite`.
 
@@ -8,6 +13,15 @@ Tokio and `tokio-tungstenite`.
 - Request batches, with typed results
 - Password authentication, event subscriptions, and JSON or MessagePack encoding
 - Cheap, cloneable clients that can be shared across tasks
+
+## Installation
+
+```sh
+cargo add obsr
+cargo add tokio --features macros,rt-multi-thread
+```
+
+Turn on the server in OBS under **Tools > WebSocket Server Settings**.
 
 ## Usage
 
@@ -50,75 +64,43 @@ async fn main() -> obsr::Result<()> {
 }
 ```
 
-`examples/watch.rs` is a small program that prints what a running OBS is doing:
-
-```sh
-cargo run --example watch -- ws://localhost:4455 your-password
-```
-
-### Batches
-
-```rust,no_run
-use obsr::requests::{GetSceneList, GetVersion};
-use obsr::{Client, RequestBatch};
-
-async fn report(client: &Client) -> obsr::Result<()> {
-    let mut batch = RequestBatch::new();
-    let version = batch.push(GetVersion)?;
-    let scenes = batch.push(GetSceneList::default())?;
-
-    let response = client.batch(batch).await?;
-    println!("{}", response.get(&version)?.obs_version);
-    println!("{}", response.get(&scenes)?.scenes.len());
-    Ok(())
-}
-```
-
-### Errors
-
-A failed request is an `Error::Request`, with the server's status and comment. A closed connection is
-an `Error::Closed`, with the close code. A rejected password appears that way too:
-
-```rust,no_run
-use obsr::enums::{RequestStatus, WebSocketCloseCode};
-use obsr::requests::SetCurrentProgramScene;
-use obsr::{ConnectOptions, Error};
-
-async fn switch_scene(url: &str, password: &str, scene: &str) -> obsr::Result<()> {
-    let client = match ConnectOptions::new(url).password(password).connect().await {
-        Err(Error::Closed(info))
-            if info.close_code() == Some(WebSocketCloseCode::AuthenticationFailed) =>
-        {
-            eprintln!("wrong password");
-            return Ok(());
-        }
-        other => other?,
-    };
-
-    let request = SetCurrentProgramScene {
-        scene_name: Some(scene.to_owned()),
-        ..Default::default()
-    };
-    match client.request(request).await {
-        Err(Error::Request(error)) if error.status() == Some(RequestStatus::ResourceNotFound) => {
-            eprintln!("no scene named {scene}");
-            Ok(())
-        }
-        other => other.map(|_| ()),
-    }
-}
-```
-
-### Timeouts
-
 The client has no built-in timeouts. All of its futures can be cancelled safely, so wrap any call in
 `tokio::time::timeout`.
 
-### Anything newer than this crate
+## Examples
 
-`Client::request_raw` sends any request by name, and events this crate does not know arrive as
-`Event::Unknown` with their payload intact. You can also implement the `Request` trait for your own
-types.
+| Example | What it does |
+| --- | --- |
+| [`scenes`](examples/scenes.rs) | Lists scenes, creates one, or switches to one |
+| [`mute`](examples/mute.rs) | Lists audio inputs, or toggles mute on one |
+| [`batch`](examples/batch.rs) | Sends several requests in one message, with typed results |
+| [`errors`](examples/errors.rs) | Handles a wrong password, a missing scene, and a timeout |
+| [`watch`](examples/watch.rs) | Prints what a running OBS is doing |
+
+They connect to `ws://localhost:4455` without a password unless you set `OBS_URL` and `OBS_PASSWORD`:
+
+```sh
+OBS_PASSWORD=your-password cargo run --example scenes -- switch BRB
+```
+
+## Compatibility
+
+The types are generated from the spec for obs-websocket 5.7.6 (RPC version 1), which has been tested
+against OBS 33.0.1. The older versions below come from comparing the spec at each release, and have
+not been tested directly.
+
+| obs-websocket | What to expect |
+| --- | --- |
+| 5.6.0 and newer | All typed responses and events decode |
+| 5.4.0 to 5.5.x | The same, except `InputCreated` events arrive as `Event::Unknown` |
+| 5.0.0 to 5.3.x | Connects, but common responses like `GetCurrentProgramScene` return a decode error and many events arrive as `Event::Unknown` |
+| 4.x | Not supported |
+
+A request the server doesn't have yet returns an `Error::Request`.
+
+For a server newer than this crate, `Client::request_raw` sends any request by name, and events this
+crate doesn't know arrive as `Event::Unknown` with their payload intact. You can also implement the
+`Request` trait for your own types.
 
 ## Where this differs from the spec
 
@@ -173,3 +155,7 @@ OBSR_TEST_URL=ws://localhost:4455 OBSR_TEST_PASSWORD=secret OBSR_TEST_MEDIA_FILE
 ```
 
 `OBSR_TEST_PASSWORD` and `OBSR_TEST_MEDIA_FILE` are optional.
+
+## License
+
+Licensed under either of [Apache-2.0](LICENSE-APACHE.txt) or [MIT](LICENSE-MIT.txt), at your option.
